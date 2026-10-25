@@ -1,0 +1,65 @@
+{
+  "blocked_users": {
+    "description": "黑名单账号", "type": "list", "default": [],
+    "hint": "默认所有人可用。这里填 平台:账号 或纯账号 会被拒绝；管理员也能在聊天里用“拉黑/解除拉黑”管理运行期黑名单。"
+  },
+  "extra_admins": {
+    "description": "额外管理员（可管理黑名单）", "type": "list", "default": [],
+    "hint": "AstrBot 管理员（admins_id）默认就能管理黑名单；这里可额外填 平台:账号 或纯账号。"
+  },
+  "contacts": {
+    "description": "联系人别名与私聊会话（可选）", "type": "list", "default": [],
+    "hint": "每项 别名=平台实例ID:FriendMessage:账号，如 张三=qqbot:FriendMessage:123456789。口语里 @对方或直接给 QQ 号也能用；此处适合固定常用联系人。"
+  },
+  "allow_mentions": {
+    "description": "允许用消息中的 @ 或 QQ 号指定对象", "type": "bool", "default": true,
+    "hint": "默认开启：口语里 @对方或直接给 QQ 号即可作为目标。关闭后只能用 contacts 登记的联系人，适合严格白名单场景。"
+  },
+  "allow_raw_target": {
+    "description": "允许任意账号字符串/完整会话作为目标", "type": "bool", "default": false,
+    "hint": "关闭时，除 @、QQ 号和 contacts 外不接受其他账号写法。开启后授权用户可指定任意 FriendMessage 会话；风险更高，请配合严格 allowed_users。"
+  },
+  "provider_id": {
+    "description": "代聊使用的聊天模型提供商 ID", "type": "string", "default": "",
+    "hint": "留空跟随发起会话的聊天提供商。这条私聊消息和群内 @ 发言都由 AstrBot 的 LLM 按人格生成，插件只负责传递与发送。"
+  },
+  "persona_style_extra": {
+    "description": "额外人格风格要求", "type": "string", "default": "",
+    "hint": "追加到人格提示词后，加强称呼、语气词、口头禅、颜文字等风格；留空只用保存的人格。例：称呼我“主人”，句尾带～，自然口语化。"
+  },
+  "persona_status_reports": {
+    "description": "状态回报人格化", "type": "bool", "default": true,
+    "hint": "开启时，“已传达/对方还没回”也用保存的人格口吻发送；关闭则发机械格式的状态回报。"
+  },
+  "timeout_seconds": {"description": "等待对方回复的超时秒数（60–86400）", "type": "int", "default": 300},
+  "followup_window_seconds": {
+    "description": "跟转窗口秒数（0 关闭）", "type": "int", "default": 1800,
+    "hint": "对方首次回复后，在这段时间内再发来的消息，若 LLM 判断仍与先前话题相关，会继续按人格转述给发起人。每次成功跟转会顺延窗口，受 followup_max_relays 限制。"
+  },
+  "followup_max_relays": {
+    "description": "单个任务最多跟转次数（0 关闭）", "type": "int", "default": 10,
+    "hint": "防止对方持续聊天导致无休止转述和模型费用；达到上限后不再跟转，但正常聊天不受影响。"
+  },
+  "allow_nickname_target": {
+    "description": "允许用群昵称指定私聊对象", "type": "bool", "default": true,
+    "hint": "开启后可在群里说“私聊小明”，按每日名册或 @ 收录的昵称匹配 QQ；同名不唯一时不会猜。"
+  },
+  "roster_sync_enabled": {
+    "description": "每天自动同步群成员名册", "type": "bool", "default": true,
+    "hint": "通过 OneBot 的 get_group_list / get_group_member_list 拉取机器人所在群及成员昵称、QQ，存入本地 roster.sqlite3。"
+  },
+  "roster_sync_hour": {
+    "description": "每日名册同步时间（0–23 点）", "type": "int", "default": 4,
+    "hint": "按 roster_sync_timezone 的本地时间在指定小时执行一次；也可用“/代聊 名册”手动立即同步。"
+  },
+  "roster_sync_timezone": {
+    "description": "名册同步时区", "type": "string", "default": "Asia/Shanghai",
+    "hint": "容器通常运行在 UTC；默认按 Asia/Shanghai 计算同步小时，避免时差。"
+  },
+  "temp_session_enabled": {
+    "description": "非好友时用群临时会话私聊", "type": "bool", "default": true,
+    "hint": "普通私聊失败（未加好友）时，通过 send_private_msg + group_id 走群临时会话；需要协议端（如 NapCat）支持。"
+  },
+  "llm_timeout": {"description": "每次模型调用超时秒数（10–180）", "type": "int", "default": 60},
+  "retention_days": {"description": "已结束任务正文保留天数（1–90）", "type": "int", "default": 7}
+}

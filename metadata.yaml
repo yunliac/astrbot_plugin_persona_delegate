@@ -1,0 +1,6 @@
+name: astrbot_plugin_persona_delegate
+display_name: 踢一下
+author: local
+desc: 踢一下：用一句口语让机器人按保存的人格替你私聊或群里 @ 对方，并把对方的回复转述给你。
+version: v1.0.0
+astrbot_version: '>=4.29.1'
