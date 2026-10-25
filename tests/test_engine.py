@@ -99,6 +99,41 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         e = engine.Engine(Path(self.temp.name) / "default.sqlite", self.send, self.generate)
         self.assertEqual(e.timeout_seconds, 300)
 
+    def test_split_text_uses_sentence_boundaries_and_limit(self):
+        text = "第一句。" * 40
+        chunks = engine.split_text(text, 60)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 60 for chunk in chunks))
+        self.assertEqual("".join(chunks), text)
+
+    def test_split_text_hard_cuts_without_punctuation(self):
+        text = "长" * 200
+        chunks = engine.split_text(text, 50)
+        self.assertEqual([len(chunk) for chunk in chunks], [50, 50, 50, 50])
+        self.assertEqual("".join(chunks), text)
+        self.assertEqual(engine.split_text("", 50), [])
+
+    async def test_long_first_message_is_split_into_multiple_sends(self):
+        self.e.max_message_chars = 60
+        self.persona_output = "句子。" * 40
+        await self.start()
+        targets = self.target_messages()
+        self.assertGreater(len(targets), 1)
+        self.assertTrue(all(len(text) <= 60 for text in targets))
+        self.assertEqual("".join(targets), self.persona_output)
+
+    async def test_long_relay_is_split_into_multiple_reports(self):
+        self.e.max_message_chars = 60
+        self.e.followup_window = 0
+        self.relay_output = "转述。" * 40
+        await self.start()
+        before = len(self.sent)
+        await self.e.receive("target", "原文")
+        reports = [text for target, text in self.sent[before:] if target == "report"]
+        self.assertGreater(len(reports), 1)
+        self.assertTrue(all(len(text) <= 60 for text in reports))
+        self.assertEqual("".join(reports), self.relay_output)
+
     async def test_first_reply_is_reported_in_persona_style(self):
         self.e.followup_window = 0  # isolate the first-reply relay from follow-ups
         await self.start()

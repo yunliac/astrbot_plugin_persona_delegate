@@ -159,6 +159,12 @@ def load_adapter():
         cancel_target=AsyncMock(return_value=0),
         tasks_for_target=AsyncMock(return_value=[]),
     ))
+
+    def stub_split_text(text, limit):
+        text = str(text or "")
+        return [text[index:index + limit] for index in range(0, len(text), limit)] if text else []
+
+    engine_module.split_text = stub_split_text
     roster_module = types.ModuleType(package_name + ".roster")
     roster_module.Roster = StubRoster
     moderation_module = types.ModuleType(package_name + ".moderation")
@@ -465,6 +471,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["followup_window"], 60)
         self.assertEqual(kwargs["followup_max"], 3)
         self.assertIs(kwargs["persona_status_reports"], True)
+        self.assertEqual(kwargs["max_message_chars"], 1200)
         self.assertEqual(kwargs["timeout_seconds"], 300)
 
     async def test_loading_restores_preexisting_modules_and_leaves_no_fake_package(self):
@@ -996,6 +1003,16 @@ class ChannelAndGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("天", self.adapter._remaining_label(now + 2 * 86400))
         self.assertIn("小时", self.adapter._remaining_label(now + 7200))
         self.assertIn("分钟", self.adapter._remaining_label(now + 90))
+
+    async def test_long_group_message_is_split_with_at_on_first_chunk(self):
+        self.config["max_message_chars"] = 200
+        self.adapter._generate = AsyncMock(return_value="长" * 450)
+        event = self.group_event("@小明 明天见", [self.module.At(qq="42", name="小明")])
+        await self.adapter.private_chat(event, "", "明天见")
+        self.assertGreaterEqual(self.context.send_message.await_count, 2)
+        chains = [call.kwargs["chain"] for call in self.module.MessageChain.call_args_list]
+        self.assertIsInstance(chains[0][0], self.module.At)
+        self.assertIsInstance(chains[1][0], self.module.Plain)
 
     async def test_group_prompt_names_the_caller_as_subject(self):
         event = self.group_event("@小明 明天见", [self.module.At(qq="42", name="小明")])

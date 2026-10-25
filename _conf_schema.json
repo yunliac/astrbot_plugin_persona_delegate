@@ -31,6 +31,10 @@
     "description": "状态回报人格化", "type": "bool", "default": true,
     "hint": "开启时，“已传达/对方还没回”也用保存的人格口吻发送；关闭则发机械格式的状态回报。"
   },
+  "max_message_chars": {
+    "description": "单条消息最大字数", "type": "int", "default": 1200,
+    "hint": "私聊首条、转述回报、群内 @ 超过这个长度时，会按句号/换行自动拆成多条发送。"
+  },
   "timeout_seconds": {"description": "等待对方回复的超时秒数（60–86400）", "type": "int", "default": 300},
   "followup_window_seconds": {
     "description": "跟转窗口秒数（0 关闭）", "type": "int", "default": 1800,

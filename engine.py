@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-__all__ = ["Engine"]
+__all__ = ["Engine", "split_text"]
 _LOG = logging.getLogger(__name__)
 _LOCK = asyncio.Lock()
 _ACTIVE = ("waiting", "sending")
@@ -53,6 +53,32 @@ _NO_REPLY_INSTRUCTION = (
 )
 
 
+def split_text(text: str, limit: int) -> list[str]:
+    """按句号/换行等自然边界把长文本切成多条，尽量不破坏句子。"""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    limit = max(50, int(limit))
+    chunks: list[str] = []
+    remaining = text
+    boundaries = ("\n", "。", "！", "？", "；", "!", "?", ";", ". ")
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = max(window.rfind(mark) for mark in boundaries)
+        if cut < limit // 2:
+            cut = limit
+        else:
+            mark = max((m for m in boundaries if window.rfind(m) == cut), key=len)
+            cut += len(mark)
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining.strip():
+        chunks.append(remaining.strip())
+    return chunks
+
+
 class Engine:
     """Serialize all operations and persist state before the target send.
 
@@ -75,6 +101,7 @@ class Engine:
         followup_window: float = 1800,
         followup_max: int = 10,
         persona_status_reports: bool = True,
+        max_message_chars: int = 1200,
     ) -> None:
         for name, value in (("timeout_seconds", timeout_seconds), ("llm_timeout", llm_timeout), ("retention_days", retention_days)):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
@@ -92,6 +119,7 @@ class Engine:
         self.followup_window = float(followup_window)
         self.followup_max = followup_max
         self.persona_status_reports = bool(persona_status_reports)
+        self.max_message_chars = max(50, int(max_message_chars))
         self._db: sqlite3.Connection | None = None
 
     def _conn(self) -> sqlite3.Connection:
@@ -125,10 +153,11 @@ class Engine:
         )
 
     def _queue(self, task: dict[str, Any], message: str) -> None:
-        self._conn().execute(
-            "INSERT INTO outbox(task_id,report_to,text,attempts,next_attempt,created) VALUES(?,?,?,0,?,?)",
-            (task["id"], task["report_to"], message[:_MAX_TEXT], time.time(), time.time()),
-        )
+        for chunk in split_text(message, self.max_message_chars) or [str(message)]:
+            self._conn().execute(
+                "INSERT INTO outbox(task_id,report_to,text,attempts,next_attempt,created) VALUES(?,?,?,0,?,?)",
+                (task["id"], task["report_to"], chunk, time.time(), time.time()),
+            )
 
     @staticmethod
     def _report(task: dict[str, Any], reason: str, *, evidence: str = "", label: str = "对方原文：", title: str = "【代聊回报】") -> str:
@@ -329,13 +358,22 @@ class Engine:
             if time.time() >= task["deadline"]:
                 self._finish(task, "timeout", "任务超时，未发送消息。")
                 return
-            message = body[:_MAX_TEXT]
+            chunks = split_text(body, self.max_message_chars) or [body]
+            message = "\n".join(chunks)
             entry = {"role": "assistant", "text": message, "at": time.time(), "delivery": "uncertain"}
             task["transcript"].append(entry)
             with self._conn():
                 self._save(task)
             send_attempted = True
-            await asyncio.wait_for(self.send(task["target"], message), timeout=min(_SEND_TIMEOUT, max(0.001, task["deadline"] - time.time())))
+            for index, chunk in enumerate(chunks):
+                if time.time() >= task["deadline"]:
+                    raise TimeoutError("task deadline reached during chunked send")
+                await asyncio.wait_for(
+                    self.send(task["target"], chunk),
+                    timeout=min(_SEND_TIMEOUT, max(0.001, task["deadline"] - time.time())),
+                )
+                if index < len(chunks) - 1:
+                    await asyncio.sleep(0.4)
             entry["delivery"] = "sent"
             task["turns"] = 1
             task["status"] = "waiting"
@@ -343,7 +381,7 @@ class Engine:
                 self._save(task)
             notice = await self._waiting_notice(task)
             with self._conn():
-                self._queue(task, notice[:_MAX_TEXT])
+                self._queue(task, notice)
         except asyncio.CancelledError:
             self._finish(task, "failed", "操作被取消，发送结果可能不确定，不会自动重发。")
             raise
@@ -388,7 +426,7 @@ class Engine:
         task["status"] = status
         with self._conn():
             self._save(task)
-            self._queue(task, str(message)[:_MAX_TEXT])
+            self._queue(task, str(message))
         if status == "completed":
             self._open_followup(task)
         else:
@@ -462,7 +500,7 @@ class Engine:
                 "UPDATE followups SET count=count+1, until=? WHERE target=?",
                 (time.time() + self.followup_window, task["target"]),
             )
-            self._queue(task, message[:_MAX_TEXT])
+            self._queue(task, message)
         await self._flush_outbox()
         return True
 

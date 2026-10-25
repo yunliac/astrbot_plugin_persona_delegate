@@ -26,7 +26,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 
-from .engine import Engine
+from .engine import Engine, split_text
 from .moderation import Blocklist
 from .optout import OptOut
 from .roster import Roster
@@ -55,7 +55,7 @@ GROUP_STYLE = (
 )
 
 
-@register("astrbot_plugin_persona_delegate", "local", "踢一下：用一句口语让机器人替你私聊或群里@对方，并转述对方的回复", "1.0.0")
+@register("astrbot_plugin_persona_delegate", "local", "踢一下（私聊嘴替工具）：用一句口语让机器人替你私聊或群里@对方，并转述对方的回复", "1.0.0")
 class PersonaDelegate(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -71,6 +71,7 @@ class PersonaDelegate(Star):
             followup_window=self._number("followup_window_seconds", 1800, 0, 86400),
             followup_max=self._number("followup_max_relays", 10, 0, 100),
             persona_status_reports=bool(self.config.get("persona_status_reports", True)),
+            max_message_chars=self._number("max_message_chars", 1200, 200, 4000),
         )
         self.roster = Roster(data_dir / "roster.sqlite3")
         self.blocklist = Blocklist(data_dir / "blocklist.sqlite3")
@@ -660,8 +661,16 @@ class PersonaDelegate(Star):
 
     async def _send_group(self, event, resolved, text):
         # 只带账号构造 At，避免依赖各适配器对昵称字段的差异；平台会自行显示 @ 对象。
-        chain = MessageChain(chain=[At(qq=resolved["account"]), Plain(" " + text)])
-        return await self.context.send_message(event.unified_msg_origin, chain)
+        chunks = split_text(text, self._number("max_message_chars", 1200, 200, 4000)) or [str(text)]
+        sent = False
+        for index, chunk in enumerate(chunks):
+            components = [At(qq=resolved["account"])] if index == 0 else []
+            components.append(Plain((" " if index == 0 else "") + chunk))
+            chain = MessageChain(chain=components)
+            sent = await self.context.send_message(event.unified_msg_origin, chain) or sent
+            if index < len(chunks) - 1:
+                await asyncio.sleep(0.4)
+        return sent
 
     @filter.llm_tool(name="persona_chat_control")
     async def control(self, event: AstrMessageEvent, action: str, task_id: str = "", target: str = "") -> str:
