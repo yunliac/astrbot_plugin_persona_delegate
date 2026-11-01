@@ -64,6 +64,61 @@ class OptOutTests(unittest.TestCase):
         accounts = [row["account"] for row in self.optout.entries()]
         self.assertEqual(accounts, ["permanent"])
 
+    def test_sender_blocks_are_persistent_and_idempotent(self):
+        self.optout.block_sender("qq", " 123 ", " 456 ")
+        first = self.optout.blocked_senders("qq", "123")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(set(first[0]), {"platform", "account", "sender_account", "created"})
+        self.assertEqual(first[0]["sender_account"], "456")
+        self.assertGreater(first[0]["created"], 0)
+        self.optout.block_sender("qq", "123", "456")
+        self.assertEqual(self.optout.blocked_senders("qq", "123"), first)
+        self.optout.close()
+        self.optout.initialize()
+        self.assertEqual(self.optout.blocked_senders("qq", "123"), first)
+        self.assertTrue(self.optout.is_sender_blocked("qq", "123", "456"))
+
+    def test_sender_blocks_are_directional_and_scope_isolated(self):
+        self.optout.block_sender("qq", "123", "456")
+        self.assertFalse(self.optout.is_sender_blocked("qq", "456", "123"))
+        self.assertFalse(self.optout.is_sender_blocked("telegram", "123", "456"))
+        self.assertFalse(self.optout.is_sender_blocked("qq", "789", "456"))
+        self.assertFalse(self.optout.is_sender_blocked("qq", "123", "789"))
+        self.assertEqual(self.optout.blocked_senders("telegram", "123"), [])
+        self.assertEqual(self.optout.blocked_senders("qq", "789"), [])
+
+    def test_unblock_removes_only_matching_sender_and_does_not_clear_optout(self):
+        self.optout.set("qq", "123", 0)
+        self.optout.block_sender("qq", "123", "456")
+        self.optout.block_sender("qq", "123", "789")
+        self.assertTrue(self.optout.unblock_sender("qq", " 123 ", " 456 "))
+        self.assertFalse(self.optout.unblock_sender("qq", "123", "456"))
+        self.assertFalse(self.optout.is_sender_blocked("qq", "123", "456"))
+        self.assertTrue(self.optout.is_sender_blocked("qq", "123", "789"))
+        self.assertTrue(self.optout.is_opted_out("qq", "123"))
+        self.optout.clear("qq", "123")
+        self.optout.prune_expired()
+        self.assertTrue(self.optout.is_sender_blocked("qq", "123", "789"))
+
+    def test_sender_blocks_do_not_create_global_optout(self):
+        self.optout.block_sender("qq", "123", "456")
+        self.assertFalse(self.optout.is_opted_out("qq", "123"))
+        self.assertIsNone(self.optout.status("qq", "123"))
+        self.assertEqual(self.optout.entries(), [])
+
+    def test_sender_block_empty_accounts_rejected(self):
+        for account, sender in (("", "456"), ("123", "  "), (None, "456"), ("123", None)):
+            with self.subTest(account=account, sender=sender), self.assertRaises(ValueError):
+                self.optout.block_sender("qq", account, sender)
+        self.assertEqual(self.optout.blocked_senders("qq", "123"), [])
+
+    def test_sender_blocks_order_is_stable(self):
+        self.optout.block_sender("qq", "123", "b")
+        self.optout.block_sender("qq", "123", "a")
+        with self.optout._conn():
+            self.optout._conn().execute("UPDATE sender_blocks SET created=1")
+        self.assertEqual([r["sender_account"] for r in self.optout.blocked_senders("qq", "123")], ["a", "b"])
+
     def test_empty_account_is_rejected(self):
         with self.assertRaises(ValueError):
             self.optout.set("qq", "   ", 3600)

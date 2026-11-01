@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "plugin_version": "1.0.0beta",
+  "id": "6df2f3e17cb2447dad621a27d377756c",
+  "timestamp": "2026-11-01T04:47:45.081270+00:00",
+  "stage": "operation",
+  "exception_type": "RuntimeError",
+  "frames": [
+    {
+      "filename": "main.py",
+      "function": "_confirmation",
+      "line": 699
+    },
+    {
+      "filename": "tasks.py",
+      "function": "wait_for",
+      "line": 488
+    },
+    {
+      "filename": "mock.py",
+      "function": "_execute_mock_call",
+      "line": 2333
+    }
+  ],
+  "chain": [],
+  "troubleshooting": [
+    "Inspect task status and service logs before retrying; actions may already have executed. Share this sanitized report with the maintainer if needed."
+  ],
+  "self_check": {
+    "passed": true,
+    "no_sensitive_keys": true,
+    "frames_valid": true
+  }
+}

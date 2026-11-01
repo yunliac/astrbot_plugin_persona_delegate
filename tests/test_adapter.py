@@ -67,6 +67,10 @@ class StubOptOut:
         self.set = Mock(return_value=0.0)
         self.clear = Mock(return_value=True)
         self.is_opted_out = Mock(return_value=False)
+        self.is_sender_blocked = Mock(return_value=False)
+        self.block_sender = Mock()
+        self.unblock_sender = Mock(return_value=True)
+        self.blocked_senders = Mock(return_value=[])
         self.status = Mock(return_value=None)
         self.prune_expired = Mock()
         self.entries = Mock(return_value=[])
@@ -88,9 +92,13 @@ class StubRoster:
         self.path = path
         self.initialize = Mock()
         self.close = Mock()
-        self.find_member = Mock(return_value=None)
-        self.find_member_any = Mock(return_value=None)
+        self.find_candidates = Mock(return_value=[])
+        self.add_alias = Mock()
         self.group_for = Mock(return_value="")
+        # Existing positive cases run with a synchronized shared-group roster.
+        # Negative DM cases explicitly replace this with an empty list.
+        self.common_groups = Mock(return_value=["100"])
+        self.is_shared_group = Mock(return_value=True)
         self.remember_mention = Mock()
         self.replace_group = Mock(return_value=0)
         self.prune_groups = Mock()
@@ -140,7 +148,8 @@ def load_adapter():
         command=identity_decorator,
         event_message_type=identity_decorator,
         on_decorating_result=identity_decorator,
-        EventMessageType=types.SimpleNamespace(PRIVATE_MESSAGE="private", GROUP_MESSAGE="group"),
+        on_llm_request=identity_decorator,
+        EventMessageType=types.SimpleNamespace(ALL="all", PRIVATE_MESSAGE="private", GROUP_MESSAGE="group"),
     )
     modules["astrbot.api.message_components"].Plain = StubPlain
     modules["astrbot.api.message_components"].At = StubAt
@@ -157,6 +166,7 @@ def load_adapter():
         status=AsyncMock(return_value=[]),
         receive=AsyncMock(return_value=False),
         cancel_target=AsyncMock(return_value=0),
+        cancel_pair=AsyncMock(return_value=0),
         tasks_for_target=AsyncMock(return_value=[]),
     ))
 
@@ -247,9 +257,163 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.event = FakeEvent()
         self.adapter._persona = AsyncMock(return_value=("chosen-persona", "persona prompt"))
 
+    async def test_help_command_lists_usage_and_stops_llm_without_side_effects(self):
+        for text in ("/踢一下 help", "/踢一下 HELP", "/踢一下 帮助", "/踢一下"):
+            self.event.text = text
+            chunks = [r async for r in self.adapter.help_command(self.event)]
+            result = "".join(chunks)
+            for command in ("/tj", "/td 拒收", "/td 恢复", "/代聊 进度", "/代聊 导出", "/代聊 确认导入", "同群", "1.0.0beta"):
+                self.assertIn(command, result)
+            self.assertTrue(all(len(chunk) <= 1200 for chunk in chunks))
+        self.event.stop_event.assert_called()
+        self.engine.start.assert_not_awaited()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_error_export_only_admin_dm_and_errors_not_forwarded(self):
+        self.event.text = "/代聊 错误日志"
+        result = [r async for r in self.adapter.chat_command(self.event)]
+        self.assertIn("只有管理员", result[0])
+        self.config["extra_admins"] = ["owner"]
+        result = [r async for r in self.adapter.chat_command(self.event)]
+        self.assertIn("管理员私聊", result[0])
+        await self.adapter.on_private_reply(self.event)
+        self.engine.receive.assert_not_awaited()
+
+    async def test_error_export_alias_calls_same_method(self):
+        self.adapter._export_errors = AsyncMock(return_value="exported")
+        self.event.text = "/踢一下 错误日志"
+        self.assertEqual([r async for r in self.adapter.help_command(self.event)], ["exported"])
+        self.adapter._export_errors.assert_awaited_once_with(self.event)
+
+    async def test_help_unknown_argument_shows_only_usage(self):
+        self.event.text = "/踢一下 anything"
+        rows = [r async for r in self.adapter.help_command(self.event)]
+        self.assertEqual(rows, ["查看指令大全与用法请发：/踢一下 help"])
+
+    async def test_help_not_forwarded_as_reply(self):
+        for text in ("/踢一下 help", "踢一下 help"):
+            self.event.text = text
+            await self.adapter.on_private_reply(self.event)
+        self.engine.receive.assert_not_awaited()
+
+    async def test_delegate_help_alias_uses_same_full_help(self):
+        self.event.text = "/代聊 help"
+        result = "".join([r async for r in self.adapter.chat_command(self.event)])
+        self.assertIn("指令大全", result)
+        self.assertIn("/td 拒收", result)
+
     def authorize(self):
         self.config["allowed_users"] = ["qq:owner"]
         self.config["contacts"] = ["Alice=qq:FriendMessage:friend"]
+
+    async def test_tj_numeric_alias_preserves_owner_and_group(self):
+        self.event.text = "/tj 123456 我的 好朋友"
+        result = [r async for r in self.adapter.nickname_command(self.event)]
+        self.assertIn("已为你添加昵称", result[0])
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "group-1", "qq:owner", "我的 好朋友", "123456")
+        self.event.stop_event.assert_called_once()
+        self.engine.start.assert_not_awaited()
+
+    async def test_tj_real_at_and_bot_wake_uses_component_text(self):
+        self.event.components = [StubAt("bot"), StubPlain(" /tj "), StubAt("123456", "对方"), StubPlain(" 阿乖")]
+        self.event.text = "@机器人 /tj @对方 阿乖"
+        result = [r async for r in self.adapter.nickname_command(self.event)]
+        self.assertIn("阿乖", result[0])
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "group-1", "qq:owner", "阿乖", "123456")
+
+    async def test_tj_private_alias_scope(self):
+        self.event.unified_msg_origin = "qq:FriendMessage:owner"
+        self.event.text = "/tj 123456 阿乖"
+        _ = [r async for r in self.adapter.nickname_command(self.event)]
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "", "qq:owner", "阿乖", "123456")
+
+    async def test_tj_invalid_inputs_never_save(self):
+        for text, components in [
+            ("/tj 123456", []), ("/tj @小明 阿乖", []),
+            ("/tj 123456 a\nb", []), ("/tj 123456 " + "a" * 81, []),
+            ("/tj 123456 @name", []),
+            ("/tj @all 昵称", [StubPlain("/tj "), StubAt("all"), StubPlain(" 昵称")]),
+            ("/tj @a @b 昵称", [StubPlain("/tj "), StubAt("123456"), StubAt("234567"), StubPlain(" 昵称")]),
+        ]:
+            self.event.text, self.event.components = text, components
+            result = [r async for r in self.adapter.nickname_command(self.event)]
+            self.assertNotIn("已为你添加昵称", result[0])
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_tj_blocked_user_cannot_save(self):
+        self.event.text = "/tj 123456 阿乖"
+        self.adapter.blocklist.is_blocked.return_value = True
+        result = [r async for r in self.adapter.nickname_command(self.event)]
+        self.assertIn("禁止使用", result[0])
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_tj_rejects_nonshared_member_in_group_and_dm(self):
+        for origin in ("qq:GroupMessage:group-1", "qq:FriendMessage:owner"):
+            self.event.unified_msg_origin = origin
+            self.event.text = "/tj 123456 阿乖"
+            self.adapter.roster.is_shared_group.return_value = False
+            self.adapter.roster.common_groups.return_value = []
+            result = [r async for r in self.adapter.nickname_command(self.event)]
+            self.assertIn("只能为同群成员", result[0])
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_tj_not_relayed_to_task_owner(self):
+        self.event.text = "/tj 123456 阿乖"
+        await self.adapter.on_private_reply(self.event)
+        self.engine.receive.assert_not_awaited()
+
+    async def test_migration_non_admin_is_denied_before_storage_access(self):
+        self.event.text = "/代聊 导出"
+        result = [r async for r in self.adapter.chat_command(self.event)]
+        self.assertIn("只有管理员", result[0])
+        self.event.stop_event.assert_called_once()
+
+    async def test_migration_commands_are_not_relayed_as_private_replies(self):
+        self.event.unified_msg_origin = "qq:FriendMessage:owner"
+        for text in ["/代聊 导出", "/代聊 导入预检 valid.json", "/代聊 确认导入 secret"]:
+            self.event.text = text
+            await self.adapter.on_private_reply(self.event)
+        self.engine.receive.assert_not_awaited()
+
+    async def test_migration_admin_group_is_denied(self):
+        self.config["extra_admins"] = ["owner"]
+        self.event.text = "/代聊 导入 文件.json"
+        result = [r async for r in self.adapter.chat_command(self.event)]
+        self.assertIn("仅限管理员私聊", result[0])
+
+    async def test_migration_rejects_paths_and_invalid_mapping(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "inbox").mkdir()
+            (root / "inbox" / "valid.json").write_text("{}")
+            self.config["extra_admins"] = ["owner"]
+            self.event.unified_msg_origin = "qq:FriendMessage:owner"
+            with patch.object(self.adapter, "_migration_dir", return_value=root), patch.object(self.adapter, "_migration_stores", return_value={}):
+                for argument in ["../escape.json", "C:\\escape.json", "valid.json *=qq", "valid.json old=qq old=qq2"]:
+                    with self.assertRaises(ValueError):
+                        await self.adapter._migration_command(self.event, "导入", argument)
+
+    async def test_migration_confirmation_is_bound_and_file_change_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "inbox").mkdir()
+            source = root / "inbox" / "valid.json"
+            source.write_text("{}")
+            self.config["extra_admins"] = ["owner"]
+            self.event.unified_msg_origin = "qq:FriendMessage:owner"
+            self.engine.migrate = AsyncMock(return_value={"inserted": 1})
+            with patch.object(self.adapter, "_migration_dir", return_value=root), patch.object(self.adapter, "_migration_stores", return_value={}):
+                result = await self.adapter._migration_command(self.event, "导入预检", "valid.json old=new")
+                self.assertIn("预检通过", result)
+                token = self.adapter._migration_pending["qq:owner"][0]
+                source.write_text('{"changed":true}')
+                with self.assertRaisesRegex(ValueError, "发生变化"):
+                    await self.adapter._migration_command(self.event, "确认导入", token)
+                self.assertEqual(self.engine.migrate.await_count, 1)
+                with self.assertRaisesRegex(ValueError, "无效或过期"):
+                    await self.adapter._migration_command(self.event, "确认导入", token)
 
     async def test_default_allows_everyone_to_use_tools(self):
         self.assertTrue(self.adapter._allowed(self.event))
@@ -342,6 +506,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                                  ("qq:FriendMessage:friend", "Alice"))
 
     async def test_unconfigured_raw_targets_are_denied_by_default_and_when_disabled(self):
+        self.config["allow_nickname_target"] = False
         for enabled in (None, False):
             if enabled is not None:
                 self.config["allow_raw_target"] = enabled
@@ -351,7 +516,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                         self.adapter._target(self.event, target)
 
     async def test_enabled_raw_target_accepts_account_and_explicit_private_session(self):
-        self.config["allow_raw_target"] = True
+        self.config.update(allow_raw_target=True, allow_nickname_target=False)
         self.assertEqual(self.adapter._target(self.event, " friend "),
                          ("qq:FriendMessage:friend", "friend"))
         self.assertEqual(self.adapter._target(self.event, "other:FriendMessage:42"),
@@ -711,7 +876,8 @@ class ChannelAndGroupTests(unittest.IsolatedAsyncioTestCase):
         self.engine.start.assert_not_awaited()
         self.context.send_message.assert_not_awaited()
 
-    async def test_group_channel_outside_group_is_refused(self):
+    async def test_group_channel_without_shared_group_is_refused(self):
+        self.adapter.roster.common_groups.return_value = []
         event = self.dm_event("在群里@他一下")
         result = await self.adapter.private_chat(event, "123456", "说一声", channel="group")
         self.assertIn("未执行代聊", result)
@@ -791,32 +957,35 @@ class ChannelAndGroupTests(unittest.IsolatedAsyncioTestCase):
         self.engine.initialize = AsyncMock()
         self.engine.tick = AsyncMock()
         self.engine.close = AsyncMock()
+        self.adapter._upgrade_data = Mock()
         await self.adapter.initialize()
+        self.adapter._upgrade_data.assert_called_once_with()
         self.adapter.roster.initialize.assert_called_once_with()
         self.engine.initialize.assert_awaited_once()
         await self.adapter.terminate()
         self.engine.close.assert_awaited_once()
 
     async def test_group_nickname_resolves_to_member_account(self):
-        self.adapter.roster.find_member.return_value = {
+        self.adapter.roster.common_groups.return_value = ["g1"]
+        self.adapter.roster.find_candidates.return_value = [{
             "qq": "777", "nickname": "小明", "card": "", "group_id": "g1",
-        }
+        }]
         event = self.group_event("帮我私聊一下小明，问明天几点到")
         result = json.loads(await self.adapter.private_chat(event, "小明", "问明天几点到"))
         self.assertEqual(result["channel"], "private")
         kwargs = self.engine.start.await_args.kwargs
         self.assertEqual(kwargs["target"], "qq:FriendMessage:777")
-        self.adapter.roster.find_member.assert_called_once_with("qq", "g1", "小明")
+        self.adapter.roster.find_candidates.assert_called_once_with("qq", "g1", "小明", "qq:owner")
         self.assertEqual(self.adapter._group_hints["qq:FriendMessage:777"], "g1")
 
     async def test_dm_unique_nickname_resolves_across_groups(self):
-        self.adapter.roster.find_member_any.return_value = {
-            "qq": "888", "nickname": "小红", "card": "", "group_id": "g2",
-        }
+        self.adapter.roster.find_candidates.return_value = [{
+            "platform": "qq", "qq": "888", "nickname": "小红", "card": "", "group_id": "g2",
+        }]
         event = self.dm_event("帮我私聊一下小红，问几点到")
         await self.adapter.private_chat(event, "小红", "问几点到")
         self.assertEqual(self.engine.start.await_args.kwargs["target"], "qq:FriendMessage:888")
-        self.adapter.roster.find_member_any.assert_called_once_with("qq", "小红")
+        self.adapter.roster.find_candidates.assert_called_once_with("qq", "", "小红", "qq:owner")
 
     async def test_group_at_bot_records_mentioned_members(self):
         event = self.group_event("私聊一下 @小明", [self.module.At(qq="42", name="小明")])
@@ -939,6 +1108,38 @@ class ChannelAndGroupTests(unittest.IsolatedAsyncioTestCase):
                          "小明说接下来两小时不想被打扰～")
         event.stop_event.assert_called_once_with()
 
+    async def test_td_reject_single_sender_and_restore_private_only(self):
+        event = self.dm_event("/td 拒收 123456")
+        rows = [r async for r in self.adapter.td_command(event)]
+        self.assertIn("已拒收", rows[0])
+        self.adapter.optout.block_sender.assert_called_once_with("qq", "owner", "123456")
+        self.engine.cancel_pair.assert_awaited_once_with("qq:FriendMessage:owner", "qq:123456")
+        self.context.send_message.assert_not_awaited()
+        event.text = "/td 恢复 123456"
+        rows = [r async for r in self.adapter.td_command(event)]
+        self.assertIn("已恢复", rows[0])
+        self.adapter.optout.unblock_sender.assert_called_once_with("qq", "owner", "123456")
+
+    async def test_sender_rejection_blocks_private_but_not_group(self):
+        self.adapter.optout.is_sender_blocked.return_value = True
+        result = await self.adapter.private_chat(self.group_event("帮我私聊他"), "123456", "问好")
+        self.assertIn("不接收你", result)
+        self.engine.start.assert_not_awaited()
+        self.adapter._generate.assert_not_awaited()
+        result = json.loads(await self.adapter.private_chat(self.group_event("在群里@他"), "123456", "问好"))
+        self.assertEqual(result["channel"], "group")
+
+    async def test_sender_rejection_list_is_owner_only(self):
+        self.adapter.optout.blocked_senders.return_value = [{"sender_account": "123456"}]
+        rows = [r async for r in self.adapter.td_command(self.dm_event("/td 拒收列表"))]
+        self.assertIn("123456", rows[0])
+        self.adapter.optout.blocked_senders.assert_called_once_with("qq", "owner")
+        self.context.send_message.assert_not_awaited()
+
+    async def test_sender_rejection_command_not_relayed(self):
+        await self.adapter.on_private_reply(self.dm_event("/td 拒收 123456"))
+        self.engine.receive.assert_not_awaited()
+
     async def test_td_permanent_and_cancel(self):
         event = self.dm_event("/td 永久")
         results = [item async for item in self.adapter.td_command(event)]
@@ -1031,11 +1232,37 @@ class ChannelAndGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.get_extra("persona_delegate_reply"),
                          "主人～已经私聊小明，让他三小时后找你啦～")
 
-    async def test_group_chat_sets_persona_confirmation_for_the_reply(self):
-        self.adapter._generate = AsyncMock(return_value="已经在群里 @ 过小明啦～")
+    async def test_group_chat_suppresses_confirmation_for_the_caller(self):
         event = self.group_event("@小明 明天见", [self.module.At(qq="42", name="小明")])
-        await self.adapter.private_chat(event, "", "明天见")
-        self.assertEqual(event.get_extra("persona_delegate_reply"), "已经在群里 @ 过小明啦～")
+        result = json.loads(await self.adapter.private_chat(event, "", "明天见"))
+        self.assertTrue(result["silent"])
+        self.assertIsNone(event.get_extra("persona_delegate_reply"))
+        self.assertTrue(event.get_extra("persona_delegate_silent"))
+        self.assertEqual(self.adapter._generate.await_count, 1)
+        event.result = types.SimpleNamespace(chain=[self.module.Plain("已经发出啦")])
+        await self.adapter.persona_decorate(event)
+        self.assertEqual(event.result.chain, [])
+
+    async def test_tool_preparation_failure_does_not_send(self):
+        self.adapter._prepare_goal = AsyncMock(side_effect=RuntimeError("工具处理未能完成"))
+        result = await self.adapter.private_chat(self.group_event("帮我私聊123456"), "123456", "处理目标")
+        self.assertIn("工具处理未能完成", result)
+        self.engine.start.assert_not_awaited()
+        self.context.send_message.assert_not_awaited()
+
+    async def test_tool_preparation_result_is_sent_after_processing(self):
+        self.adapter._prepare_goal = AsyncMock(return_value="原目标，处理结果")
+        await self.adapter.private_chat(self.group_event("帮我私聊123456"), "123456", "原目标")
+        self.assertEqual(self.engine.start.await_args.kwargs["goal"], "原目标，处理结果")
+
+    async def test_request_tools_are_captured_without_global_registry_expansion(self):
+        event = self.dm_event("请处理目标")
+        tools = object()
+        request = types.SimpleNamespace(func_tool=tools, system_prompt="人格")
+        await self.adapter.tool_reasoning_request(event, request)
+        self.assertIs(event.get_extra("persona_delegate_tools"), tools)
+        self.assertIn("DSH", request.system_prompt)
+        self.assertIn("当前会话", request.system_prompt)
 
     async def test_persona_decorate_replaces_the_main_model_reply(self):
         event = self.group_event("帮我私聊一下 123456")
@@ -1073,9 +1300,501 @@ class ChannelAndGroupTests(unittest.IsolatedAsyncioTestCase):
     async def test_mentions_can_be_disabled_by_configuration(self):
         self.config["allow_mentions"] = False
         event = self.group_event("帮我私聊一下 @小明", [self.module.At(qq="42", name="小明")])
-        result = await self.adapter.private_chat(event, "@小明", "问明天几点到")
-        self.assertIn("未执行代聊", result)
+        result = json.loads(await self.adapter.private_chat(event, "@小明", "问明天几点到"))
+        self.assertEqual(result["status"], "needs_target")
+        self.adapter.roster.find_candidates.assert_called_once_with("qq", "g1", "@小明", "qq:owner")
         self.engine.start.assert_not_awaited()
+        self.context.send_message.assert_not_awaited()
+
+
+class DMSharedGroupScopeTests(unittest.IsolatedAsyncioTestCase):
+    """DM delegation is confined to synchronized, same-platform shared groups."""
+
+    setUp = ChannelAndGroupTests.setUp
+    group_event = ChannelAndGroupTests.group_event
+    dm_event = ChannelAndGroupTests.dm_event
+    sent_chain = ChannelAndGroupTests.sent_chain
+
+    def assert_not_sent(self):
+        self.adapter.roster.add_alias.assert_not_called()
+        self.engine.start.assert_not_awaited()
+        self.context.send_message.assert_not_awaited()
+
+    async def test_dm_all_resolved_target_sources_require_shared_group(self):
+        cases = (
+            ("123456", [], {}),
+            ("ignored", [StubAt(qq="123456", name="小明")], {}),
+            ("Alice", [], {}),
+            ("qq:FriendMessage:friend", [], {}),
+            ("qq:FriendMessage:123456", [], {"allow_raw_target": True}),
+            ("legacy-account", [], {"allow_raw_target": True, "allow_nickname_target": False}),
+        )
+        for channel in ("private", "group"):
+            for target, components, config in cases:
+                with self.subTest(channel=channel, target=target, mention=bool(components)):
+                    self.setUp()
+                    self.config.update(config)
+                    self.adapter.roster.common_groups.return_value = []
+                    text = "私聊他，问几点到" if channel == "private" else "在群里@他，问几点到"
+                    result = await self.adapter.private_chat(self.dm_event(text, components), target, "问几点到", channel=channel)
+                    self.assertIn("未执行代聊", result)
+                    self.assertIn("共同群", result)
+                    self.assert_not_sent()
+
+    async def test_dm_stale_alias_candidate_without_shared_group_is_not_selected(self):
+        self.adapter.roster.common_groups.return_value = []
+        self.adapter.roster.find_candidates.return_value = [
+            {"platform": "qq", "qq": "123456", "nickname": "旧别名", "card": "", "group_id": "old-group"},
+        ]
+        event = self.dm_event("私聊旧别名，问几点到")
+        result = json.loads(await self.adapter.private_chat(event, "旧别名", "问几点到"))
+        self.assertEqual(result["status"], "needs_target")
+        pending = self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin)
+        self.assertEqual(pending["candidates"], [])
+        self.assert_not_sent()
+
+    async def test_dm_filters_candidates_before_deciding_ambiguity(self):
+        self.adapter.roster.find_candidates.return_value = [
+            {"platform": "qq", "qq": "123456", "nickname": "小明甲", "card": "", "group_id": "100"},
+            {"platform": "qq", "qq": "234567", "nickname": "小明乙", "card": "", "group_id": "200"},
+        ]
+        self.adapter.roster.common_groups.side_effect = lambda platform, owner, target: ["100"] if target == "123456" else []
+        result = json.loads(await self.adapter.private_chat(self.dm_event("私聊小明，问几点到"), "小明", "问几点到"))
+        self.assertEqual(result["channel"], "private")
+        self.assertEqual(self.engine.start.await_args.kwargs["target"], "qq:FriendMessage:123456")
+        self.adapter.roster.add_alias.assert_not_called()
+        self.context.send_message.assert_not_awaited()
+
+    async def test_dm_cross_platform_contact_and_raw_session_are_refused(self):
+        self.config.update(contacts=["Elsewhere=other:FriendMessage:123456"], allow_raw_target=True)
+        for target in ("Elsewhere", "other:FriendMessage:123456", "other:FriendMessage:234567"):
+            for channel in ("private", "group"):
+                with self.subTest(target=target, channel=channel):
+                    event = self.dm_event("私聊他" if channel == "private" else "在群里@他")
+                    result = await self.adapter.private_chat(event, target, "问几点到", channel=channel)
+                    self.assertIn("未执行代聊", result)
+                    self.assertIn("共同群", result)
+                    self.assert_not_sent()
+
+    async def test_dm_group_phrase_routes_to_only_shared_group(self):
+        for channel in ("auto", "group"):
+            with self.subTest(channel=channel):
+                self.setUp()
+                result = json.loads(await self.adapter.private_chat(self.dm_event("在群里@他一下"), "123456", "问几点到", channel=channel))
+                self.assertEqual(result["channel"], "group")
+                self.context.send_message.assert_awaited_once()
+                self.assertEqual(self.context.send_message.await_args.args[0], "qq:GroupMessage:100")
+                self.assertEqual(self.sent_chain()[0].qq, "123456")
+                self.engine.start.assert_not_awaited()
+
+    async def test_dm_multiple_shared_groups_require_explicit_group_id(self):
+        self.adapter.roster.common_groups.return_value = ["100", "200"]
+        result = await self.adapter.private_chat(self.dm_event("在群里@他一下"), "123456", "问几点到", channel="group")
+        self.assertIn("未执行代聊", result)
+        self.assertIn("群", result)
+        self.assert_not_sent()
+
+    async def test_dm_explicit_shared_group_id_routes_to_selected_group(self):
+        self.adapter.roster.common_groups.return_value = ["100", "200"]
+        result = json.loads(await self.adapter.private_chat(self.dm_event("在群里@他一下"), "123456", "问几点到", channel="group", group_id="200"))
+        self.assertEqual(result["channel"], "group")
+        self.context.send_message.assert_awaited_once()
+        self.assertEqual(self.context.send_message.await_args.args[0], "qq:GroupMessage:200")
+        self.engine.start.assert_not_awaited()
+
+    async def test_dm_explicit_group_id_allows_requested_group_without_group_words(self):
+        self.adapter.roster.common_groups.return_value = ["100", "200"]
+        response = await self.adapter.private_chat(self.dm_event("帮我跟他说一声"), "123456", "问几点到", channel="group", group_id="100")
+        self.assertNotIn("未执行代聊", response)
+        result = json.loads(response)
+        self.assertEqual(result["channel"], "group")
+        self.assertEqual(self.context.send_message.await_args.args[0], "qq:GroupMessage:100")
+        self.engine.start.assert_not_awaited()
+
+    async def test_dm_nonshared_group_id_is_refused_for_all_channels(self):
+        for channel in ("private", "group"):
+            with self.subTest(channel=channel):
+                event = self.dm_event("私聊他" if channel == "private" else "在群里@他")
+                result = await self.adapter.private_chat(event, "123456", "问几点到", channel=channel, group_id="999")
+                self.assertIn("未执行代聊", result)
+                self.assertIn("共同群", result)
+                self.assert_not_sent()
+
+    async def test_dm_requested_group_without_group_words_or_id_is_refused(self):
+        result = await self.adapter.private_chat(self.dm_event("帮我跟他说一声"), "123456", "问几点到", channel="group")
+        self.assertIn("未执行代聊", result)
+        self.assert_not_sent()
+
+    async def test_group_public_at_requires_exact_current_shared_group(self):
+        self.adapter.roster.common_groups.return_value = ["other-group"]
+        self.adapter.roster.is_shared_group.return_value = False
+        result = await self.adapter.private_chat(self.group_event("在群里@他，问几点到"), "123456", "问几点到")
+        self.assertIn("当前群", result)
+        self.assert_not_sent()
+
+    async def test_group_public_all_sources_reject_outside_member_before_send(self):
+        for source in ("qq", "mention", "contact", "nickname", "admin"):
+            with self.subTest(source=source):
+                self.setUp()
+                self.adapter.roster.is_shared_group.return_value = False
+                self.adapter.roster.common_groups.return_value = ["unrelated"]
+                event = self.group_event("在群里@他，问几点到")
+                target = "123456"
+                if source == "mention":
+                    event.components = [StubAt("123456")]
+                elif source == "contact":
+                    self.config["contacts"] = ["好友=qq:FriendMessage:123456"]
+                    target = "好友"
+                elif source == "nickname":
+                    self.adapter.roster.find_candidates.return_value = [{"platform": "qq", "group_id": "g1", "qq": "123456", "nickname": "机密昵称", "card": ""}]
+                    target = "好友"
+                elif source == "admin":
+                    self.config["extra_admins"] = [event.get_sender_id()]
+                result = await self.adapter.private_chat(event, target, "问几点到")
+                self.assertIn("needs_target" if source == "nickname" else "当前群", result)
+                self.assertNotIn("机密昵称", result)
+                self.assert_not_sent()
+
+    async def test_group_cannot_redirect_to_another_group(self):
+        result = await self.adapter.private_chat(self.group_event("在群里@他，问几点到"), "123456", "问几点到", group_id="other")
+        self.assertIn("不能指定其他群", result)
+        self.assert_not_sent()
+
+    async def test_group_private_requires_caller_and_target_shared_group_for_all_sources(self):
+        for source in ("qq", "mention", "contact", "nickname", "admin"):
+            with self.subTest(source=source):
+                self.setUp()
+                self.adapter.roster.common_groups.return_value = []
+                self.adapter.roster.is_shared_group.return_value = False
+                event = self.group_event("帮我私聊他，问几点到")
+                target = "123456"
+                if source == "mention":
+                    event.components = [StubAt("123456")]
+                elif source == "contact":
+                    self.config["contacts"] = ["好友=qq:FriendMessage:123456"]
+                    target = "好友"
+                elif source == "nickname":
+                    self.adapter.roster.find_candidates.return_value = [{"platform": "qq", "group_id": "g1", "qq": "123456", "nickname": "阿乖", "card": ""}]
+                    target = "阿乖"
+                elif source == "admin":
+                    self.config["extra_admins"] = [event.get_sender_id()]
+                result = await self.adapter.private_chat(event, target, "问几点到")
+                self.assertIn("needs_target" if source == "nickname" else "当前群", result)
+                self.assert_not_sent()
+
+    async def test_group_private_shared_group_uses_verified_group_for_temp_session(self):
+        self.adapter.roster.common_groups.return_value = ["verified"]
+        event = self.group_event("帮我私聊他，问几点到")
+        result = json.loads(await self.adapter.private_chat(event, "123456", "问几点到"))
+        self.assertEqual(result["channel"], "private")
+        self.assertEqual(self.adapter._group_hints["qq:FriendMessage:123456"], "g1")
+        self.engine.start.assert_awaited_once()
+        self.adapter.roster.is_shared_group.assert_called_with("qq", "g1", str(event.get_sender_id()), "123456")
+
+
+class TargetConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    """Run nickname resolution and confirmation through the real adapter."""
+
+    def setUp(self):
+        ChannelAndGroupTests.setUp(self)
+        self.candidates = [
+            {"platform": "qq", "qq": "123456", "nickname": "小明甲", "card": "", "group_id": "g1"},
+            {"platform": "qq", "qq": "234567", "nickname": "小明乙", "card": "", "group_id": "g1"},
+        ]
+
+    group_event = ChannelAndGroupTests.group_event
+    dm_event = ChannelAndGroupTests.dm_event
+    sent_chain = ChannelAndGroupTests.sent_chain
+
+    async def ask(self, private=True, candidates=None, origin="qq:GroupMessage:g1"):
+        self.adapter.roster.find_candidates.return_value = candidates or []
+        event = FakeEvent(origin=origin, text="帮我私聊小明，问明天几点到" if private else "帮我跟小明说，明天几点到")
+        result = json.loads(await self.adapter.private_chat(event, "小明", "问明天几点到", "saved-id"))
+        self.assertEqual(result["status"], "needs_target")
+        self.context.send_message.assert_not_awaited()
+        self.engine.start.assert_not_awaited()
+        return event, result
+
+    async def confirm(self, text, components=None, **kwargs):
+        event = FakeEvent(text=text, components=components, **kwargs)
+        results = [item async for item in self.adapter.on_target_confirmation(event)]
+        return event, results
+
+    def assert_not_sent(self):
+        self.context.send_message.assert_not_awaited()
+        self.engine.start.assert_not_awaited()
+        self.adapter._persona.assert_not_awaited()
+
+    async def test_zero_candidates_asks_without_generating_or_sending(self):
+        event, result = await self.ask()
+        self.assertIn("QQ", result["reply"])
+        self.assertIn("尚未发送", result["note"])
+        self.assertEqual(event.get_extra("persona_delegate_reply"), result["reply"])
+        pending = self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin)
+        self.assertEqual(pending["candidates"], [])
+        self.assertEqual(pending["goal"], "问明天几点到")
+        self.assert_not_sent()
+        self.adapter._generate.assert_not_awaited()
+
+    async def test_two_candidates_lists_every_account_and_nickname(self):
+        _, result = await self.ask(candidates=self.candidates)
+        for index, candidate in enumerate(self.candidates, 1):
+            self.assertIn(f"{index}. {candidate['nickname']}（QQ：{candidate['qq']}）", result["reply"])
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_unique_candidate_sends_directly_without_pending_or_alias(self):
+        self.adapter.roster.find_candidates.return_value = self.candidates[:1]
+        event = self.group_event("私聊小明，问明天几点到")
+        result = json.loads(await self.adapter.private_chat(event, "小明", "问明天几点到"))
+        self.assertEqual(result["channel"], "private")
+        self.engine.start.assert_awaited_once()
+        self.assertEqual(self.engine.start.await_args.kwargs["target"], "qq:FriendMessage:123456")
+        self.assertIsNone(self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin))
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_unmatched_qq_confirmation_restores_private_goal_and_persona_and_learns_alias(self):
+        original, _ = await self.ask()
+        event, results = await self.confirm("123456", origin=original.unified_msg_origin)
+        self.assertEqual(len(results), 1)
+        self.engine.start.assert_awaited_once()
+        kwargs = self.engine.start.await_args.kwargs
+        self.assertEqual(kwargs["target"], "qq:FriendMessage:123456")
+        self.assertEqual(kwargs["goal"], "问明天几点到")
+        self.assertEqual(kwargs["origin"], original.unified_msg_origin)
+        self.assertEqual(kwargs["owner_key"], "qq:owner")
+        self.adapter._persona.assert_awaited_once_with(event, "saved-id")
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "g1", "qq:owner", "小明", "123456")
+        self.adapter.roster.remember_mention.assert_called_once_with("qq", "g1", "123456", "123456")
+        self.context.send_message.assert_not_awaited()
+        self.assertIsNone(event.get_extra("persona_delegate_confirmed_target"))
+        self.assertIsNone(event.get_extra("persona_delegate_confirmed_channel"))
+        self.assertIsNone(event.get_extra("persona_delegate_reply"))
+        event.stop_event.assert_called_once_with()
+
+    async def test_unmatched_at_confirmation_restores_private_even_without_private_word(self):
+        original, _ = await self.ask()
+        _, results = await self.confirm("@小明", [self.module.At(qq="123456", name="小明")], origin=original.unified_msg_origin)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(self.engine.start.await_args.kwargs["target"], "qq:FriendMessage:123456")
+        self.assertEqual(self.engine.start.await_args.kwargs["goal"], "问明天几点到")
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "g1", "qq:owner", "小明", "123456")
+        self.context.send_message.assert_not_awaited()
+
+    async def test_group_candidate_number_selection_restores_group_and_does_not_learn_alias(self):
+        await self.ask(private=False, candidates=self.candidates)
+        event, results = await self.confirm("2", origin="qq:GroupMessage:g1")
+        self.assertEqual(results, [])
+        self.context.send_message.assert_awaited_once()
+        self.assertEqual(self.context.send_message.await_args.args[0], event.unified_msg_origin)
+        self.assertEqual(self.sent_chain()[0].qq, "234567")
+        self.assertIn("问明天几点到", self.adapter._generate.await_args_list[0].args[2])
+        self.engine.start.assert_not_awaited()
+        self.adapter.roster.add_alias.assert_not_called()
+        self.adapter.roster.remember_mention.assert_not_called()
+
+    async def test_candidate_qq_and_at_selection_do_not_learn_alias(self):
+        for text, components in (("234567", []), ("@小明甲", [self.module.At(qq="123456", name="小明甲")])):
+            with self.subTest(text=text):
+                self.setUp()
+                await self.ask(candidates=self.candidates)
+                _, results = await self.confirm(text, components, origin="qq:GroupMessage:g1")
+                self.assertEqual(len(results), 1)
+                self.engine.start.assert_awaited_once()
+                self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_account_outside_candidates_is_rejected_and_pending_survives(self):
+        for text, components in (("345678", []), ("@其他", [self.module.At(qq="345678", name="其他")])):
+            with self.subTest(text=text):
+                self.setUp()
+                await self.ask(candidates=self.candidates)
+                event, results = await self.confirm(text, components, origin="qq:GroupMessage:g1")
+                self.assertIn("不是刚列出的候选", results[0])
+                self.assertIsNotNone(self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin))
+                self.assert_not_sent()
+                self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_other_user_origin_or_platform_cannot_confirm(self):
+        original, _ = await self.ask()
+        for kwargs in (
+            {"sender": "other", "origin": original.unified_msg_origin},
+            {"origin": "qq:GroupMessage:g2"},
+            {"origin": "qq:FriendMessage:owner"},
+            {"platform": "other", "origin": original.unified_msg_origin},
+        ):
+            with self.subTest(kwargs=kwargs):
+                event, results = await self.confirm("123456", **kwargs)
+                self.assertEqual(results, [])
+                event.stop_event.assert_not_called()
+        self.assertIsNotNone(self.adapter.pending_targets.get("qq:owner", original.unified_msg_origin))
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_expired_confirmation_does_not_send(self):
+        with patch.object(self.module.time, "time", return_value=1000):
+            await self.ask()
+        with patch.object(self.module.time, "time", return_value=1300):
+            event, results = await self.confirm("123456", origin="qq:GroupMessage:g1")
+        self.assertEqual(results, [])
+        event.stop_event.assert_not_called()
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_cancel_removes_pending_without_sending(self):
+        for text in ("取消匹配", "取消代聊", "取消"):
+            with self.subTest(text=text):
+                await self.ask()
+                event, results = await self.confirm(text, origin="qq:GroupMessage:g1")
+                self.assertIn("已取消", results[0])
+                self.assertIsNone(self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin))
+                _, later = await self.confirm("123456", origin=event.unified_msg_origin)
+                self.assertEqual(later, [])
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_multiple_mentions_are_rejected_without_consuming_pending(self):
+        await self.ask()
+        event, results = await self.confirm("@甲 @乙", [self.module.At(qq="123456"), self.module.At(qq="234567")], origin="qq:GroupMessage:g1")
+        self.assertIn("一次只 @ 一个人", results[0])
+        self.assertIsNotNone(self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin))
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_self_and_bot_accounts_are_rejected(self):
+        for sender, self_id, text in (("123456", "999999", "123456"), ("123456", "999999", "999999")):
+            with self.subTest(text=text):
+                self.setUp()
+                origin = "qq:GroupMessage:g1"
+                initial = FakeEvent(sender=sender, self_id=self_id, origin=origin, text="帮我私聊小明")
+                await self.adapter.private_chat(initial, "小明", "问明天几点到")
+                _, results = await self.confirm(text, sender=sender, self_id=self_id, origin=origin)
+                self.assertIn("不能选择发起人或机器人自己", results[0])
+                self.assertIsNotNone(self.adapter.pending_targets.get("qq:123456", origin))
+                self.assert_not_sent()
+                self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_blocked_owner_cannot_confirm_or_learn_alias(self):
+        await self.ask()
+        self.adapter.blocklist.is_blocked.return_value = True
+        event, results = await self.confirm("123456", origin="qq:GroupMessage:g1")
+        self.assertEqual(len(results), 1)
+        self.assertIn("禁止使用代聊", results[0])
+        event.stop_event.assert_called_once_with()
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+        self.assertIsNotNone(self.adapter.pending_targets.get("qq:owner", "qq:GroupMessage:g1"))
+
+    async def test_dm_confirmation_restores_private_channel_and_uses_dm_alias_scope(self):
+        origin = "qq:FriendMessage:owner"
+        await self.ask(origin=origin)
+        _, results = await self.confirm("123456", origin=origin)
+        self.assertEqual(len(results), 1)
+        self.engine.start.assert_awaited_once()
+        self.assertEqual(self.engine.start.await_args.kwargs["origin"], origin)
+        self.assertEqual(self.engine.start.await_args.kwargs["goal"], "问明天几点到")
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "", "qq:owner", "小明", "123456")
+        self.context.send_message.assert_not_awaited()
+
+    async def test_dm_unmatched_confirmation_cannot_learn_or_send_outside_shared_groups(self):
+        for text, components in (("123456", []), ("@小明", [StubAt(qq="123456", name="小明")])):
+            with self.subTest(text=text):
+                self.setUp()
+                origin = "qq:FriendMessage:owner"
+                await self.ask(origin=origin)
+                self.adapter.roster.common_groups.return_value = []
+                event, results = await self.confirm(text, components, origin=origin)
+                self.assertEqual(len(results), 1)
+                self.assertIn("共同群", results[0])
+                self.assert_not_sent()
+                self.adapter.roster.add_alias.assert_not_called()
+                self.adapter.roster.remember_mention.assert_not_called()
+                event.stop_event.assert_called_once_with()
+
+    async def test_dm_candidate_confirmation_rechecks_shared_group_after_roster_changes(self):
+        for text, components in (("2", []), ("234567", []), ("@小明乙", [StubAt(qq="234567", name="小明乙")])):
+            with self.subTest(text=text):
+                self.setUp()
+                origin = "qq:FriendMessage:owner"
+                await self.ask(candidates=self.candidates, origin=origin)
+                self.adapter.roster.common_groups.return_value = []
+                _, results = await self.confirm(text, components, origin=origin)
+                self.assertEqual(len(results), 1)
+                self.assertIn("共同群", results[0])
+                self.assert_not_sent()
+                self.adapter.roster.add_alias.assert_not_called()
+                self.adapter.roster.remember_mention.assert_not_called()
+
+    async def test_dm_group_confirmation_rechecks_shared_group_before_learning_alias(self):
+        origin = "qq:FriendMessage:owner"
+        event = self.dm_event("在群里@小明，说一声明天见")
+        result = json.loads(await self.adapter.private_chat(event, "小明", "明天见"))
+        self.assertEqual(result["status"], "needs_target")
+        self.adapter.roster.common_groups.return_value = []
+        _, results = await self.confirm("123456", origin=origin)
+        self.assertEqual(len(results), 1)
+        self.assertIn("共同群", results[0])
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+        self.adapter.roster.remember_mention.assert_not_called()
+
+    async def test_unrelated_text_and_commands_do_not_consume_pending_or_send(self):
+        await self.ask()
+        for text in ("普通聊天", "/td 2小时", "/代聊 状态"):
+            with self.subTest(text=text):
+                event, results = await self.confirm(text, origin="qq:GroupMessage:g1")
+                self.assertEqual(results, [])
+                event.stop_event.assert_not_called()
+                self.assertIsNotNone(self.adapter.pending_targets.get("qq:owner", event.unified_msg_origin))
+        self.assert_not_sent()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_bot_mention_prefix_allows_candidate_number_confirmation(self):
+        await self.ask(private=False, candidates=self.candidates)
+        event, results = await self.confirm("@机器人 2", [self.module.At(qq="bot", name="机器人"), self.module.Plain(" 2")], origin="qq:GroupMessage:g1")
+        self.assertEqual(results, [])
+        self.context.send_message.assert_awaited_once()
+        self.assertEqual(self.sent_chain()[0].qq, "234567")
+        self.assertEqual(self.context.send_message.await_args.args[0], event.unified_msg_origin)
+        self.engine.start.assert_not_awaited()
+        self.adapter.roster.add_alias.assert_not_called()
+
+    async def test_bot_mention_prefix_allows_unmatched_qq_confirmation(self):
+        await self.ask()
+        _, results = await self.confirm("@机器人 123456", [self.module.At(qq="bot", name="机器人"), self.module.Plain(" 123456")], origin="qq:GroupMessage:g1")
+        self.assertEqual(len(results), 1)
+        self.engine.start.assert_awaited_once()
+        self.assertEqual(self.engine.start.await_args.kwargs["target"], "qq:FriendMessage:123456")
+        self.adapter.roster.add_alias.assert_called_once_with("qq", "g1", "qq:owner", "小明", "123456")
+        self.context.send_message.assert_not_awaited()
+
+    async def test_repeated_and_concurrent_confirmation_send_only_once(self):
+        import asyncio
+
+        await self.ask()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_persona(*args):
+            entered.set()
+            await release.wait()
+            return "人格", "人格提示词"
+
+        self.adapter._persona.side_effect = slow_persona
+        first_task = asyncio.create_task(self.confirm("123456", origin="qq:GroupMessage:g1"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            second = await self.confirm("123456", origin="qq:GroupMessage:g1")
+            self.assertEqual(second[1], [])
+            self.engine.start.assert_not_awaited()
+        finally:
+            release.set()
+            first = await asyncio.wait_for(first_task, timeout=2)
+        self.assertEqual(len(first[1]), 1)
+        _, repeated = await self.confirm("123456", origin="qq:GroupMessage:g1")
+        self.assertEqual(repeated, [])
+        self.engine.start.assert_awaited_once()
+        self.adapter.roster.add_alias.assert_called_once()
+        self.context.send_message.assert_not_awaited()
 
 
 if __name__ == "__main__":

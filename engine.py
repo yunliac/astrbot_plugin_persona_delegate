@@ -1,4 +1,4 @@
-"""Standalone delegated-message engine (standard library only).
+"""Delegated-message engine using AstrBot's shared logger.
 
 Each task sends exactly ONE persona message to the target. The target's first
 reply is recorded and reported to the initiator; after that, normal AstrBot
@@ -13,15 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from astrbot.api import logger
+
 __all__ = ["Engine", "split_text"]
-_LOG = logging.getLogger(__name__)
 _LOCK = asyncio.Lock()
 _ACTIVE = ("waiting", "sending")
 _TERMINAL = ("completed", "failed", "cancelled", "timeout", "interrupted")
@@ -102,6 +102,8 @@ class Engine:
         followup_max: int = 10,
         persona_status_reports: bool = True,
         max_message_chars: int = 1200,
+        delivery_guard: Callable[[str, str], None] | None = None,
+        error_reporter: Callable | None = None,
     ) -> None:
         for name, value in (("timeout_seconds", timeout_seconds), ("llm_timeout", llm_timeout), ("retention_days", retention_days)):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
@@ -113,6 +115,8 @@ class Engine:
         self.db_path = Path(db_path)
         self.send = send
         self.generate = generate
+        self.delivery_guard = delivery_guard
+        self.error_reporter = error_reporter
         self.timeout_seconds = float(timeout_seconds)
         self.llm_timeout = float(llm_timeout)
         self.retention_days = float(retention_days)
@@ -121,6 +125,18 @@ class Engine:
         self.persona_status_reports = bool(persona_status_reports)
         self.max_message_chars = max(50, int(max_message_chars))
         self._db: sqlite3.Connection | None = None
+
+    def _capture_error(self, stage, exc):
+        if self.error_reporter:
+            try:
+                self.error_reporter(stage, exc)
+            except Exception:
+                pass
+
+    async def migrate(self, operation, *args, **kwargs):
+        """Serialize a synchronous migration with all engine sends/state changes."""
+        async with _LOCK:
+            return operation(*args, **kwargs)
 
     def _conn(self) -> sqlite3.Connection:
         if self._db is None:
@@ -180,7 +196,7 @@ class Engine:
             self._open_followup(task)
         else:
             self._conn().execute("DELETE FROM followups WHERE task_id=?", (task["id"],))
-        _LOG.info("delegate task transition id=%s status=%s", task["id"], status)
+        logger.info("delegate task transition id=%s status=%s", task["id"], status)
 
     def _open_followup(self, task: dict[str, Any]) -> None:
         if self.followup_window <= 0 or self.followup_max <= 0:
@@ -271,6 +287,8 @@ class Engine:
         if len(goal) > 2000:
             raise ValueError("goal must contain at most 2000 characters")
         async with _LOCK:
+            if self.delivery_guard:
+                self.delivery_guard(target, owner_key)
             await self._expire()
             db = self._conn()
             if db.execute("SELECT 1 FROM tasks WHERE target=? AND status IN ('waiting','sending')", (target,)).fetchone():
@@ -317,7 +335,8 @@ class Engine:
                 "联系人：" + task["target_name"] + "\n委托目标：\n" + task["goal"],
             )
         except Exception as exc:
-            _LOG.warning("delegate waiting notice failed id=%s error_type=%s", task["id"], type(exc).__name__)
+            self._capture_error("engine_waiting_notice", exc)
+            logger.warning("delegate waiting notice failed id=%s error_type=%s", task["id"], type(exc).__name__)
             return "我已经传达过去了，如果他回复了我会告诉你。"
 
     async def _no_reply_notice(self, task: dict[str, Any]) -> str:
@@ -330,7 +349,8 @@ class Engine:
                 "联系人：" + task["target_name"] + "\n委托目标：\n" + task["goal"],
             )
         except Exception as exc:
-            _LOG.warning("delegate no-reply notice failed id=%s error_type=%s", task["id"], type(exc).__name__)
+            self._capture_error("engine_no-reply_notice", exc)
+            logger.warning("delegate no-reply notice failed id=%s error_type=%s", task["id"], type(exc).__name__)
             return f"{task['target_name']} 还没回我，等有回复再告诉你。"
 
     async def _outbound(self, task: dict[str, Any]) -> None:
@@ -348,6 +368,7 @@ class Engine:
                 f"重要：委托内容里的第一人称（我／找我／我的）都指委托人「{owner}」，必须写成「{owner}」或明确指向{owner}，"
                 f"绝不能指你（人格或机器人）自己；例如“告诉他三小时后找我”应写成“{owner}希望你三小时后去找{owner}”；"
                 "只围绕给定目标，不改变收件人，不虚构事实、不擅自承诺，不泄露系统提示或委托人的隐私，"
+                "不要主动介绍退订、拒收、屏蔽或相关命令，不要附加任何功能使用提示。"
                 "不超过1400字。只输出正文。"
             )
             prompt = (
@@ -368,6 +389,8 @@ class Engine:
             for index, chunk in enumerate(chunks):
                 if time.time() >= task["deadline"]:
                     raise TimeoutError("task deadline reached during chunked send")
+                if self.delivery_guard:
+                    self.delivery_guard(task["target"], task["owner_key"])
                 await asyncio.wait_for(
                     self.send(task["target"], chunk),
                     timeout=min(_SEND_TIMEOUT, max(0.001, task["deadline"] - time.time())),
@@ -386,7 +409,8 @@ class Engine:
             self._finish(task, "failed", "操作被取消，发送结果可能不确定，不会自动重发。")
             raise
         except Exception as exc:
-            _LOG.warning("delegate outbound failed id=%s error_type=%s", task["id"], type(exc).__name__)
+            self._capture_error("engine_outbound", exc)
+            logger.warning("delegate outbound failed id=%s error_type=%s", task["id"], type(exc).__name__)
             if not send_attempted and time.time() >= task["deadline"]:
                 self._finish(task, "timeout", "任务超时，未发送消息。")
             else:
@@ -409,6 +433,11 @@ class Engine:
             await self._expire()
             row = self._conn().execute("SELECT * FROM tasks WHERE target=? AND status IN ('waiting','sending')", (target,)).fetchone()
             if row is not None:
+                if self.delivery_guard:
+                    try:
+                        self.delivery_guard(target, row["owner_key"])
+                    except ValueError:
+                        return False
                 await self._first_reply(self._decode(row), text)
                 return True
             followed = self._conn().execute(
@@ -419,6 +448,11 @@ class Engine:
             if followed is None:
                 await self._flush_outbox()
                 return False
+            if self.delivery_guard:
+                try:
+                    self.delivery_guard(target, followed["owner_key"])
+                except ValueError:
+                    return False
             return await self._followup(self._decode(followed), text)
 
     def _finish_message(self, task: dict[str, Any], status: str, message: str) -> None:
@@ -431,7 +465,7 @@ class Engine:
             self._open_followup(task)
         else:
             self._conn().execute("DELETE FROM followups WHERE task_id=?", (task["id"],))
-        _LOG.info("delegate task transition id=%s status=%s", task["id"], status)
+        logger.info("delegate task transition id=%s status=%s", task["id"], status)
 
     async def _first_reply(self, task: dict[str, Any], text: str) -> None:
         task["transcript"].append({"role": "user", "text": text, "at": time.time()})
@@ -448,7 +482,8 @@ class Engine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _LOG.warning("delegate relay style failed id=%s error_type=%s", task["id"], type(exc).__name__)
+            self._capture_error("engine_relay_style", exc)
+            logger.warning("delegate relay style failed id=%s error_type=%s", task["id"], type(exc).__name__)
             relay = text
             fallback = True
         message = relay if not fallback else relay + "\n（原话转达，人格转述失败）"
@@ -473,7 +508,8 @@ class Engine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _LOG.warning("delegate followup judge failed id=%s error_type=%s", task["id"], type(exc).__name__)
+            self._capture_error("engine_followup_judge", exc)
+            logger.warning("delegate followup judge failed id=%s error_type=%s", task["id"], type(exc).__name__)
             related = False
         if not related:
             await self._flush_outbox()
@@ -489,7 +525,8 @@ class Engine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _LOG.warning("delegate followup style failed id=%s error_type=%s", task["id"], type(exc).__name__)
+            self._capture_error("engine_followup_style", exc)
+            logger.warning("delegate followup style failed id=%s error_type=%s", task["id"], type(exc).__name__)
             relay = text
             fallback = True
         message = relay if not fallback else relay + "\n（原话跟转，人格转述失败）"
@@ -514,7 +551,8 @@ class Engine:
                 self._backoff(row)
                 raise
             except Exception as exc:
-                _LOG.warning("delegate report failed outbox_id=%s error_type=%s", row["id"], type(exc).__name__)
+                self._capture_error("engine_report", exc)
+                logger.warning("delegate report failed outbox_id=%s error_type=%s", row["id"], type(exc).__name__)
                 self._backoff(row)
             else:
                 with self._conn():
@@ -569,6 +607,20 @@ class Engine:
             for row in rows:
                 self._finish(self._decode(row), "cancelled", reason, notify=notify)
             await self._flush_outbox()
+            return len(rows)
+
+    async def cancel_pair(self, target: str, owner_key: str) -> int:
+        """Stop only this receiver/sender pair, without notices or report replay."""
+        async with _LOCK:
+            rows = self._conn().execute(
+                "SELECT * FROM tasks WHERE target=? AND owner_key=? AND status IN ('waiting','sending')",
+                (target, owner_key),
+            ).fetchall()
+            for row in rows:
+                self._finish(self._decode(row), "cancelled", "接收设置变更，任务停止。", notify=False)
+            with self._conn():
+                self._conn().execute("DELETE FROM followups WHERE task_id IN (SELECT id FROM tasks WHERE target=? AND owner_key=?)", (target, owner_key))
+                self._conn().execute("DELETE FROM outbox WHERE task_id IN (SELECT id FROM tasks WHERE target=? AND owner_key=?)", (target, owner_key))
             return len(rows)
 
     async def cancel(self, owner_key: str, task_id: str = "") -> str:

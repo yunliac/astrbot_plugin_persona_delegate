@@ -3,6 +3,7 @@
 表结构：
 - groups(platform, group_id, name, member_count, synced)
 - members(platform, group_id, qq, nickname, card, source, updated)
+- aliases(platform, scope_group, owner_key, alias, qq)，独立于每日成员快照
 
 ``source`` 为 ``sync``（每日成员列表快照）或 ``mention``（群内 @ 时即时收录）。
 """
@@ -41,6 +42,11 @@ class Roster:
             );
             CREATE INDEX IF NOT EXISTS members_lookup ON members(platform, group_id, nickname);
             CREATE INDEX IF NOT EXISTS members_qq ON members(platform, qq);
+            CREATE TABLE IF NOT EXISTS aliases (
+                platform TEXT NOT NULL, scope_group TEXT NOT NULL,
+                owner_key TEXT NOT NULL, alias TEXT NOT NULL, qq TEXT NOT NULL,
+                PRIMARY KEY(platform, scope_group, owner_key, alias, qq)
+            );
         """)
         self._db = db
 
@@ -109,7 +115,7 @@ class Roster:
                 )
 
     def remember_mention(self, platform: str, group_id: str, qq: str, nickname: str) -> None:
-        """群内 @ 时即时收录；已有同步数据只补空昵称。"""
+        """群内 @ 时即时收录；非空昵称更新为最新值，保留已有群名片。"""
         qq = str(qq or "").strip()
         if not qq:
             return
@@ -124,37 +130,60 @@ class Roster:
                 "INSERT INTO members(platform,group_id,qq,nickname,card,source,updated) "
                 "VALUES(?,?,?,?,'','mention',?) "
                 "ON CONFLICT(platform,group_id,qq) DO UPDATE SET "
-                "nickname=CASE WHEN members.nickname='' THEN excluded.nickname ELSE members.nickname END, "
+                "nickname=CASE WHEN excluded.nickname<>'' THEN excluded.nickname ELSE members.nickname END, "
                 "updated=excluded.updated",
                 (str(platform), str(group_id), qq, str(nickname or "").strip(), now),
             )
 
-    def find_member(self, platform: str, group_id: str, name: str) -> dict[str, Any] | None:
+    def add_alias(self, platform: str, group_id: str, owner_key: str, alias: str, qq: str) -> None:
+        """保存发起人确认的称呼；不修改官方昵称，也不随成员快照删除。"""
+        text = str(alias or "").strip().lstrip("@")
+        qq = str(qq or "").strip()
+        if not text or not qq:
+            return
+        with self._conn():
+            self._conn().execute(
+                "INSERT OR IGNORE INTO aliases(platform,scope_group,owner_key,alias,qq) "
+                "VALUES(?,?,?,?,?)",
+                (str(platform), str(group_id or ""), str(owner_key or ""), text, qq),
+            )
+
+    def find_candidates(
+        self, platform: str, group_id: str, name: str, owner_key: str = "",
+    ) -> list[dict[str, Any]]:
+        """精确匹配官方信息和上下文别名，按 QQ 去重，保留全部同名候选。
+
+        非空群号只查本群；空群号查该平台所有群，但只用私聊作用域的别名。
+        别名必须联接当前成员，已退群的记录不能产生候选。
+        """
         text = str(name or "").strip().lstrip("@")
         if not text:
-            return None
-        row = self._conn().execute(
-            "SELECT * FROM members WHERE platform=? AND group_id=? "
-            "AND (nickname=? OR card=? OR qq=?) ORDER BY updated DESC LIMIT 1",
-            (str(platform), str(group_id), text, text, text),
-        ).fetchone()
-        return dict(row) if row else None
+            return []
+        scope_group = str(group_id or "")
+        rows = self._conn().execute(
+            "SELECT m.* FROM members AS m "
+            "LEFT JOIN aliases AS a ON a.platform=m.platform AND a.qq=m.qq "
+            "AND a.scope_group=? AND a.owner_key=? AND a.alias=? "
+            "WHERE m.platform=? AND (?='' OR m.group_id=?) "
+            "AND (m.nickname=? OR m.card=? OR m.qq=? OR a.qq IS NOT NULL) "
+            "ORDER BY m.updated DESC, m.group_id, m.qq",
+            (scope_group, str(owner_key or ""), text, str(platform),
+             scope_group, scope_group, text, text, text),
+        ).fetchall()
+        candidates = {}
+        for row in rows:
+            candidates.setdefault(row["qq"], dict(row))
+        return list(candidates.values())
+
+    def find_member(self, platform: str, group_id: str, name: str) -> dict[str, Any] | None:
+        """兼容旧接口；同名涉及多个 QQ 时交由调用方澄清。"""
+        candidates = self.find_candidates(platform, group_id, name)
+        return candidates[0] if len(candidates) == 1 else None
 
     def find_member_any(self, platform: str, name: str) -> dict[str, Any] | None:
-        """跨群按昵称查找；只有唯一 QQ 时才返回，避免同名误发。"""
-        text = str(name or "").strip().lstrip("@")
-        if not text:
-            return None
-        rows = self._conn().execute(
-            "SELECT * FROM members WHERE platform=? AND (nickname=? OR card=? OR qq=?) "
-            "ORDER BY updated DESC",
-            (str(platform), text, text, text),
-        ).fetchall()
-        if not rows:
-            return None
-        if len({row["qq"] for row in rows}) != 1:
-            return None
-        return dict(rows[0])
+        """跨群查找；只有唯一 QQ 时才返回，避免同名误发。"""
+        candidates = self.find_candidates(platform, "", name)
+        return candidates[0] if len(candidates) == 1 else None
 
     def stats(self) -> dict[str, Any]:
         groups = self._conn().execute("SELECT COUNT(*) AS n, MAX(synced) AS last FROM groups").fetchone()
@@ -167,6 +196,23 @@ class Roster:
             (str(platform), str(group_id)),
         ).fetchone()
         return str(row["name"]) if row else ""
+
+    def common_groups(self, platform: str, caller_qq: str, target_qq: str) -> list[str]:
+        """返回双方同步快照中的共同群；@ 即时收录不能作为授权依据。"""
+        rows = self._conn().execute(
+            "SELECT DISTINCT caller.group_id FROM members AS caller "
+            "JOIN members AS target ON target.platform=caller.platform "
+            "AND target.group_id=caller.group_id "
+            "WHERE caller.platform=? AND caller.qq=? AND target.qq=? "
+            "AND caller.source='sync' AND target.source='sync' "
+            "AND caller.group_id<>'' ORDER BY caller.group_id",
+            (str(platform), str(caller_qq), str(target_qq)),
+        ).fetchall()
+        return [str(row["group_id"]) for row in rows]
+
+    def is_shared_group(self, platform: str, group_id: str, caller_qq: str, target_qq: str) -> bool:
+        """Only synchronized membership of BOTH users in this exact group authorizes use."""
+        return str(group_id) in self.common_groups(platform, caller_qq, target_qq)
 
     def group_for(self, platform: str, qq: str) -> str:
         """返回该 QQ 最近出现过的群号；用于没有显式群提示时的临时会话兜底。"""

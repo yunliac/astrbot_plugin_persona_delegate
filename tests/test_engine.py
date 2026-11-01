@@ -1,14 +1,17 @@
 """Standard-library Engine regression tests; run unittest discover -s tests -v."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import time
+from types import ModuleType
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Load this exact checkout, independently of adapter imports and package names.
 _SPEC = importlib.util.spec_from_file_location(
@@ -16,7 +19,39 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 assert _SPEC is not None and _SPEC.loader is not None
 engine = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(engine)
+# Keep SDK-free imports local to this exec; never leave stubs for other tests.
+_astrbot_stub = ModuleType("astrbot")
+_api_stub = ModuleType("astrbot.api")
+_api_stub.logger = Mock()
+_astrbot_stub.api = _api_stub
+with patch.dict(sys.modules, {"astrbot": _astrbot_stub, "astrbot.api": _api_stub}):
+    _SPEC.loader.exec_module(engine)
+
+
+class LoggingPolicyTests(unittest.TestCase):
+    def test_production_uses_astrbot_logger_not_builtin_logging(self):
+        root = Path(__file__).resolve().parents[1]
+        for path in sorted(root.glob("*.py")):
+            with self.subTest(production_file=path.name):
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        self.assertFalse(any(
+                            alias.name.split(".")[0] == "logging" for alias in node.names
+                        ), "production must not import builtin logging")
+                    elif isinstance(node, ast.ImportFrom):
+                        self.assertNotEqual(
+                            (node.module or "").split(".")[0], "logging",
+                            "production must not import from builtin logging",
+                        )
+                if path.name == "engine.py":
+                    self.assertTrue(any(
+                        isinstance(node, ast.ImportFrom)
+                        and node.level == 0 and node.module == "astrbot.api"
+                        and any(alias.name == "logger" and alias.asname in (None, "logger")
+                                for alias in node.names)
+                        for node in ast.walk(tree)
+                    ), "engine must import logger from astrbot.api")
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
@@ -40,6 +75,51 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.e = engine.Engine(Path(self.temp.name) / "tasks.sqlite", self.send, self.generate)
         await self.e.initialize()
         self.addAsyncCleanup(self.e.close)
+
+    async def test_outbound_error_calls_reporter_without_exposing_goal(self):
+        reporter = Mock()
+        self.e.error_reporter = reporter
+        self.fail_target = True
+        task = await self.start()
+        self.assertEqual(task["status"], "failed")
+        self.assertTrue(reporter.called)
+        self.assertEqual(reporter.call_args.args[0], "engine_outbound")
+        self.assertIsInstance(reporter.call_args.args[1], RuntimeError)
+
+    async def test_broken_reporter_does_not_change_failure_behavior(self):
+        self.e.error_reporter = Mock(side_effect=OSError("report disk full"))
+        self.fail_target = True
+        task = await self.start()
+        self.assertEqual(task["status"], "failed")
+
+    async def test_guard_rechecks_after_generation_before_delivery(self):
+        blocked = False
+        def guard(target, owner):
+            if blocked:
+                raise ValueError("receiver refuses sender")
+        original = self.e.generate
+        async def generate(provider, system, prompt):
+            nonlocal blocked
+            result = await original(provider, system, prompt)
+            blocked = True
+            return result
+        self.e.delivery_guard = guard
+        self.e.generate = generate
+        task = await self.start()
+        self.assertEqual(task["status"], "failed")
+        self.assertFalse(any(target.startswith("target") for target, _ in self.sent))
+
+    async def test_pair_cancel_stops_only_pair_and_removes_followup(self):
+        one = await self.start()
+        two = await self.start(target="target-two", owner_key="other")
+        self.assertEqual(await self.e.cancel_pair(one["target"], one["owner_key"]), 1)
+        self.assertEqual(self.e._task(one["id"])["status"], "cancelled")
+        self.assertEqual(self.e._task(two["id"])["status"], "waiting")
+        self.assertFalse(await self.e.receive(one["target"], "hello"))
+
+    async def test_outbound_prompt_does_not_advertise_rejection(self):
+        await self.start()
+        self.assertIn("不要主动介绍退订、拒收、屏蔽", self.calls[0][1])
 
     async def send(self, target, text):
         self.sent.append((target, text))

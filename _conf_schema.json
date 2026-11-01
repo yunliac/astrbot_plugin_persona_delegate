@@ -1,4 +1,8 @@
 {
+  "auto_error_export": {
+    "description": "发生异常时自动保存脱敏错误报告", "type": "bool", "default": true,
+    "hint": "默认开启，自动保存到插件数据目录 error-reports/，不主动发到聊天。保留最近100份，同类错误60秒内去重；管理员私聊用 /代聊 错误日志 导出最近20份。关闭后仍可手动导出已有报告。"
+  },
   "blocked_users": {
     "description": "黑名单账号", "type": "list", "default": [],
     "hint": "默认所有人可用。这里填 平台:账号 或纯账号 会被拒绝；管理员也能在聊天里用“拉黑/解除拉黑”管理运行期黑名单。"
